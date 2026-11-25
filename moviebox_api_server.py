@@ -1971,8 +1971,9 @@ async def proxy_media(
             formatted_cookie = f"signCookie={c_clean}"
 
     # Headers for upstream request
+    is_macdn = "macdn.hakunaymatata.com" in url.lower()
     upstream_headers = {
-        "User-Agent": "ExoPlayerLib/2.19.1",
+        "User-Agent": "okhttp/4.12.0" if is_macdn else "ExoPlayerLib/2.19.1",
         "Accept": "*/*",
     }
     if formatted_cookie:
@@ -1980,7 +1981,7 @@ async def proxy_media(
 
     is_m3u8 = ".m3u8" in url.lower()
     is_dash = ".mpd" in url.lower()
-    if is_m3u8 or is_dash:
+    if (is_m3u8 or is_dash) and not is_macdn:
         upstream_headers["Referer"] = "https://sportslive.wine"
 
     range_hdr = request.headers.get("Range")
