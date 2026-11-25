@@ -2352,6 +2352,73 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
             except Exception as e:
                 print(f"[STREMIO DEBUG] {imdb_id} resource/v2 EXCEPTION: {e}", flush=True)
 
+            # Also probe subject-api/get (resourceDetectors) + see-list-v2 + multi-cluster rotation
+            if not raw_streams:
+                hdrs = {
+                    "User-Agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
+                    "X-M-Version": "4.0.02",
+                }
+                r_ids = []
+                try:
+                    det_res = s["client"].request("GET", "/wefeed-mobile-bff/subject-api/get", params={"subjectId": subject_id}, headers=hdrs)
+                    detectors = (det_res.get("data") or {}).get("resourceDetectors") or [] if isinstance(det_res, dict) else []
+                    for d in detectors:
+                        if d.get("resourceId"):
+                            r_ids.append(d.get("resourceId"))
+                except Exception as e:
+                    print(f"[STREMIO DEBUG] {imdb_id} subject-api/get EXCEPTION: {e}", flush=True)
+
+                if not r_ids:
+                    try:
+                        res_list = s["client"].request("GET", "/wefeed-mobile-bff/subject-api/see-list-v2", params={"subjectId": subject_id, "page": 1, "pageSize": 20, "seeType": 1}, headers=hdrs)
+                        for item in (res_list.get("data") or {}).get("items") or []:
+                            if item.get("id"):
+                                r_ids.append(item.get("id"))
+                    except Exception:
+                        pass
+
+                for r_id in r_ids[:5]:
+                    try:
+                        p_params = {"subjectId": subject_id, "resourceId": r_id}
+                        if stream_type == "series":
+                            p_params.update({"se": season, "ep": episode, "season": season, "episode": episode})
+                        p_info = s["client"].request("GET", "/wefeed-mobile-bff/subject-api/play-info", params=p_params, headers=hdrs)
+                        p_info_data = p_info.get("data") or {} if isinstance(p_info, dict) else {}
+                        raw_streams.extend(p_info_data.get("streamList") or p_info_data.get("streams") or [])
+                    except Exception:
+                        continue
+
+            if not raw_streams:
+                clusters = [
+                    "https://apig.inmoviebox.com",
+                    "https://api5.aoneroom.com",
+                    "https://api-sin.aoneroom.com",
+                    "https://v-ios.aoneroom.com",
+                ]
+                hdrs = {
+                    "User-Agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
+                    "X-M-Version": "4.0.02",
+                }
+                orig_base = s["client"].BASE_URL
+                try:
+                    for cluster_url in clusters:
+                        try:
+                            s["client"].BASE_URL = cluster_url
+                            pms = {"subjectId": subject_id, "se": season, "ep": episode}
+                            fb_res = s["client"].request("GET", "/wefeed-mobile-bff/subject-api/play-info", params=pms, headers=hdrs)
+                            if isinstance(fb_res, dict):
+                                fb_data = fb_res.get("data") or {}
+                                srcs = fb_data.get("streamList") or fb_data.get("streams") or []
+                                if srcs:
+                                    raw_streams.extend(srcs)
+                                    if not p_data.get("subTitleList") and fb_data.get("subTitleList"):
+                                        p_data["subTitleList"] = fb_data.get("subTitleList")
+                                    print(f"[STREMIO DEBUG] {imdb_id} cluster {cluster_url} found {len(srcs)} streams", flush=True)
+                        except Exception:
+                            continue
+                finally:
+                    s["client"].BASE_URL = orig_base
+
             global_cookie = (
                 p_res.get("signCookie")
                 or p_data.get("signCookie")
