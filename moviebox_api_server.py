@@ -2245,26 +2245,8 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
     base_url = str(request.base_url).rstrip("/")
     stremio_streams: List[Dict] = []
 
-    # 2. Match direct BDIX .mp4/.mkv links from alfaftp.netlify.app first
-    norm_title = _normalize_text(title)
-    title_words = [w for w in norm_title.split() if len(w) > 1]
-    ep_tag = f"s{season:02d}e{episode:02d}"
-    for link in _fetch_bdix_links():
-        norm_link = _normalize_text(link)
-        if title_words and all(w in norm_link for w in title_words):
-            if stream_type == "movie" and year and year not in link:
-                continue
-            if stream_type == "series" and ep_tag not in norm_link.replace(" ", ""):
-                continue
-            ext = "MKV" if ".mkv" in link.lower() else "MP4"
-            stremio_streams.append({
-                "name": "BDIX Direct",
-                "title": f"{title} ({ext}) - Direct BDIX",
-                "url": link,
-                "behaviorHints": {"notWebReady": False},
-            })
-            if len(stremio_streams) >= 5:
-                break
+    # 2. BDIX loading disabled to focus 100% on MovieBox streams
+    # (Bypassed _fetch_bdix_links() so /stream/... does not wait on BDIX .txt files)
 
     # 3. Query MovieBox Android/mobile API for all available resolutions
     def _parse_res_num(st: Dict) -> int:
@@ -2314,20 +2296,50 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
             res_se = None if stream_type == "movie" else season
             res_ep = None if stream_type == "movie" else episode
 
-            p_res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
-            p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
-            raw_streams = list(p_data.get("streams") or p_data.get("streamList") or [])
+            p_res = {}
+            p_data = {}
+            raw_streams = []
+            try:
+                p_res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
+                p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
+                raw_streams = list(p_data.get("streams") or p_data.get("streamList") or [])
+                print(
+                    f"[STREMIO DEBUG] {imdb_id} subject={subject_id} play-info/v2: "
+                    f"keys={list(p_res.keys()) if isinstance(p_res, dict) else type(p_res).__name__} "
+                    f"code={p_res.get('code') if isinstance(p_res, dict) else None} "
+                    f"data_keys={list(p_data.keys()) if isinstance(p_data, dict) else None} "
+                    f"streams_count={len(raw_streams)}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[STREMIO DEBUG] {imdb_id} play-info/v2 EXCEPTION: {e}", flush=True)
 
             if not raw_streams:
-                p_res = s["stream"].get_play_info(subject_id, season=season, episode=episode)
-                p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
-                raw_streams = list(p_data.get("streamList") or p_data.get("streams") or [])
+                try:
+                    p_res = s["stream"].get_play_info(subject_id, season=season, episode=episode)
+                    p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
+                    raw_streams = list(p_data.get("streamList") or p_data.get("streams") or [])
+                    print(
+                        f"[STREMIO DEBUG] {imdb_id} play-info fallback: "
+                        f"code={p_res.get('code') if isinstance(p_res, dict) else None} "
+                        f"streams_count={len(raw_streams)}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[STREMIO DEBUG] {imdb_id} play-info EXCEPTION: {e}", flush=True)
 
             try:
                 r2_se = 0 if stream_type == "movie" else season
                 r2_ep = 0 if stream_type == "movie" else episode
                 r2_res = s["stream"].get_resources_v2(subject_id, season=r2_se, episode=r2_ep)
-                for r_item in (r2_res.get("data") or {}).get("list") or []:
+                r2_list = (r2_res.get("data") or {}).get("list") or [] if isinstance(r2_res, dict) else []
+                print(
+                    f"[STREMIO DEBUG] {imdb_id} resource/v2: "
+                    f"code={r2_res.get('code') if isinstance(r2_res, dict) else None} "
+                    f"list_count={len(r2_list)}",
+                    flush=True,
+                )
+                for r_item in r2_list:
                     r_link = r_item.get("resourceLink") or r_item.get("downloadUrl") or r_item.get("url")
                     if r_link:
                         raw_streams.append({
@@ -2338,7 +2350,7 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
                             "signCookie": r_item.get("signCookie") or "",
                         })
             except Exception as e:
-                logger.warning(f"Failed to fetch /resource/v2 mirrors for Stremio: {e}")
+                print(f"[STREMIO DEBUG] {imdb_id} resource/v2 EXCEPTION: {e}", flush=True)
 
             global_cookie = (
                 p_res.get("signCookie")
@@ -2397,6 +2409,41 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
                 if stremio_subs:
                     stream_entry["subtitles"] = stremio_subs
                 stremio_streams.append(stream_entry)
+
+            # Fallback to original get_stream() if v2/resources_v2 yielded 0 valid streams
+            if not stremio_streams:
+                print(f"[STREMIO DEBUG] {imdb_id} v2 returned 0 valid streams, falling back to get_stream()", flush=True)
+                mb_res = get_stream(subject_id, season=season, episode=episode)
+                mb_url = mb_res.get("url") or ""
+                if mb_url:
+                    mb_cookie = mb_res.get("cookie") or ""
+                    mb_referer = mb_res.get("referer") or ""
+                    if mb_cookie or mb_referer:
+                        final_url = f"{base_url}/proxy-media?url={quote(mb_url, safe='')}"
+                        if mb_cookie:
+                            final_url += f"&cookie={quote(mb_cookie, safe='')}"
+                    else:
+                        final_url = mb_url
+
+                    fb_subs = []
+                    for idx, sub in enumerate(mb_res.get("subtitles") or []):
+                        sub_u = sub.get("url") or ""
+                        if sub_u:
+                            fb_subs.append({
+                                "id": f"mb-sub-{idx}",
+                                "url": f"{base_url}/sub-proxy?u={quote(sub_u, safe='')}",
+                                "lang": sub.get("lanName") or sub.get("lan") or "Unknown",
+                            })
+
+                    fb_entry: Dict = {
+                        "name": "MovieBox",
+                        "title": f"{title}" + (f" S{season:02d}E{episode:02d}" if stream_type == "series" else ""),
+                        "url": final_url,
+                        "behaviorHints": {"notWebReady": False},
+                    }
+                    if fb_subs:
+                        fb_entry["subtitles"] = fb_subs
+                    stremio_streams.append(fb_entry)
     except Exception as e:
         logger.warning(f"MovieBox stream resolution failed for {title}: {e}")
 
