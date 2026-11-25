@@ -2266,7 +2266,32 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
             if len(stremio_streams) >= 5:
                 break
 
-    # 3. Query MovieBox via get_stream()
+    # 3. Query MovieBox Android/mobile API for all available resolutions
+    def _parse_res_num(st: Dict) -> int:
+        raw = str(st.get("resolution") or st.get("resolutions") or st.get("quality") or "").lower()
+        if "4k" in raw or "2160" in raw:
+            return 2160
+        m = re.search(r"(\d{3,4})", raw)
+        return int(m.group(1)) if m else 0
+
+    def _format_res_label(res_num: int, fallback: str = "Auto") -> str:
+        if res_num >= 2160:
+            return "4K"
+        if res_num > 0:
+            return f"{res_num}p"
+        return fallback
+
+    def _format_size(size_val: object) -> str:
+        try:
+            b = int(size_val or 0)
+        except (TypeError, ValueError):
+            return ""
+        if b <= 0:
+            return ""
+        if b >= 1024 ** 3:
+            return f"{b / (1024 ** 3):.1f} GB"
+        return f"{b / (1024 ** 2):.0f} MB"
+
     try:
         s = get_session(None)
         subj_type = 1 if stream_type == "movie" else 2
@@ -2286,32 +2311,87 @@ def stremio_stream(stream_type: str, video_id: str, request: Request):
                 break
 
         if subject_id:
-            mb_res = get_stream(subject_id, season=season, episode=episode)
-            mb_url = mb_res.get("url") or ""
-            if mb_url:
-                mb_cookie = mb_res.get("cookie") or ""
-                mb_referer = mb_res.get("referer") or ""
-                if mb_cookie or mb_referer:
-                    final_url = f"{base_url}/proxy-media?url={quote(mb_url, safe='')}"
-                    if mb_cookie:
-                        final_url += f"&cookie={quote(mb_cookie, safe='')}"
-                else:
-                    final_url = mb_url
+            res_se = None if stream_type == "movie" else season
+            res_ep = None if stream_type == "movie" else episode
 
-                stremio_subs = []
-                for idx, sub in enumerate(mb_res.get("subtitles") or []):
-                    sub_u = sub.get("url") or ""
-                    if sub_u:
-                        stremio_subs.append({
-                            "id": f"mb-sub-{idx}",
-                            "url": f"{base_url}/sub-proxy?u={quote(sub_u, safe='')}",
-                            "lang": sub.get("lanName") or sub.get("lan") or "Unknown",
+            p_res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
+            p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
+            raw_streams = list(p_data.get("streams") or p_data.get("streamList") or [])
+
+            if not raw_streams:
+                p_res = s["stream"].get_play_info(subject_id, season=season, episode=episode)
+                p_data = p_res.get("data", {}) if isinstance(p_res, dict) else {}
+                raw_streams = list(p_data.get("streamList") or p_data.get("streams") or [])
+
+            try:
+                r2_se = 0 if stream_type == "movie" else season
+                r2_ep = 0 if stream_type == "movie" else episode
+                r2_res = s["stream"].get_resources_v2(subject_id, season=r2_se, episode=r2_ep)
+                for r_item in (r2_res.get("data") or {}).get("list") or []:
+                    r_link = r_item.get("resourceLink") or r_item.get("downloadUrl") or r_item.get("url")
+                    if r_link:
+                        raw_streams.append({
+                            "url": r_link,
+                            "resolution": r_item.get("resolution") or 0,
+                            "quality": f"{r_item.get('resolution')}p" if r_item.get("resolution") else "Auto",
+                            "size": r_item.get("size") or 0,
+                            "signCookie": r_item.get("signCookie") or "",
                         })
+            except Exception as e:
+                logger.warning(f"Failed to fetch /resource/v2 mirrors for Stremio: {e}")
+
+            global_cookie = (
+                p_res.get("signCookie")
+                or p_data.get("signCookie")
+                or s["client"].session.cookies.get("signCookie")
+                or s["auth"].token
+                or ""
+            )
+
+            stremio_subs = []
+            for idx, sub in enumerate(p_data.get("subTitleList") or []):
+                sub_u = sub.get("url") or ""
+                if sub_u and "aa348f2541d13ffe" not in sub_u:
+                    stremio_subs.append({
+                        "id": f"mb-sub-{idx}",
+                        "url": f"{base_url}/sub-proxy?u={quote(sub_u, safe='')}",
+                        "lang": sub.get("lanName") or sub.get("lan") or "Unknown",
+                    })
+
+            seen_urls = set()
+            mb_candidates = []
+            for st in raw_streams:
+                u = st.get("url") or ""
+                if not u or u in seen_urls:
+                    continue
+                low = u.lower()
+                if "notice.mp4" in low or ("macdn.aoneroom.com" in low and "/other/" in low):
+                    continue
+                seen_urls.add(u)
+                res_num = _parse_res_num(st)
+                mb_candidates.append({
+                    "url": u,
+                    "res_num": res_num,
+                    "res_label": _format_res_label(res_num, str(st.get("quality") or "Auto")),
+                    "size_str": _format_size(st.get("size")),
+                    "cookie": st.get("signCookie") or global_cookie,
+                })
+
+            mb_candidates.sort(key=lambda x: x["res_num"], reverse=True)
+
+            for cand in mb_candidates:
+                proxied_url = f"{base_url}/proxy-media?url={quote(cand['url'], safe='')}"
+                if cand["cookie"]:
+                    proxied_url += f"&cookie={quote(cand['cookie'], safe='')}"
+
+                label = f"MovieBox {cand['res_label']}"
+                if cand["size_str"]:
+                    label += f" ({cand['size_str']})"
 
                 stream_entry: Dict = {
-                    "name": "MovieBox",
+                    "name": label,
                     "title": f"{title}" + (f" S{season:02d}E{episode:02d}" if stream_type == "series" else ""),
-                    "url": final_url,
+                    "url": proxied_url,
                     "behaviorHints": {"notWebReady": False},
                 }
                 if stremio_subs:
